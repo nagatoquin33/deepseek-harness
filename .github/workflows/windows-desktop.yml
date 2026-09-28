@@ -1,26 +1,24 @@
-# DeepSeek Harness Desktop (Windows) — fork 自动化：直接构建上游，不改 fork 的 master
+# DeepSeek Harness Desktop (Windows) — fork 自动化：先同步上游到 fork 的 master，再从 fork 构建
 #
-# 设计：
-#   每 6 小时（UTC 00:17/06:17/12:17/18:17 = 北京时间 08:17/14:17/20:17/02:17）
-#   查询上游 deepseek-ai/deepseek-harness 的 master 最新提交。
-#   如果 fork 里还没有对应的 release（tag = win-v<上游版本>-<上游短 sha>），就：
-#     1. resolve (ubuntu)  : 解析上游 sha / 版本，判断是否需要构建
-#     2. build   (windows) : 直接 checkout 上游该 sha，写入本 fork 的打包配置，打无签名安装包
-#     3. publish (ubuntu)  : 在本 fork 创建 GitHub Release 并上传 .exe（release 不会过期）
+# 每天 UTC 02:17（北京时间 10:17）运行，也可手动运行：
+#   1. sync    (ubuntu)  : 用 SYNC_TOKEN 把上游 deepseek-ai/deepseek-harness 的 master 合并进
+#                          fork 的 master（普通 merge，保留 fork 自己的提交，绝不 force push）；
+#                          然后禁用 fork 里除本工作流以外的所有工作流（包括上游新加的）；
+#                          最后解析版本 / tag，判断是否需要构建。
+#   2. build   (windows) : checkout fork（本仓库）同步后的 master 提交，写入打包配置，打无签名安装包
+#   3. publish (ubuntu)  : 创建 GitHub Release（标记为 Latest）并上传 .exe
 #
-#   为什么不同步 master 再构建：GITHUB_TOKEN 不能推送修改 .github/workflows/* 的提交，
-#   而上游经常改工作流；另外同步进来的上游工作流会在 fork 里被启用、白白跑失败。
-#   直接构建上游 sha 完全绕开这两个问题。fork 的定制只剩这一个文件（上游不会碰它）。
+# tag = win-v<版本>-<上游短 sha>，以“合并进来的上游 sha”为准：上游没有新提交时
+# release 已存在，直接跳过，不会重复构建。构建失败不产生 release，下次自动重试。
+# release 正文里的 “upstream-sha: ...” 记录上次构建到哪个上游提交，用于生成更新列表。
 #
-#   “上次构建到哪个上游 sha” 就记录在 release 的 tag 和正文 (upstream-sha: ...) 里，
-#   构建失败不会产生 release，下一次定时任务会自动重试。
+# 必需：仓库 secret SYNC_TOKEN（classic PAT，repo + workflow 权限；workflow 权限是因为
+# 上游会修改 .github/workflows/*）。没有该 secret 时 sync 任务直接失败并提示添加。
 #
 # 手动运行：Actions → windows-desktop → Run workflow
-#   - upstream_ref: 上游分支 / tag / sha（默认 master）
 #   - force_build : 已有同名 release 时也重新构建并覆盖安装包
 #
-# 可选：想让 fork 的 master 也跟着上游走，添加仓库 secret SYNC_TOKEN
-# （具有 repo + workflow 权限的 PAT）。没有该 secret 时 sync-fork 任务直接跳过，不影响构建。
+# 合并冲突时 sync 任务失败并列出冲突文件，fork 的 master 不会被改动，需要手动处理。
 #
 # 产物：deepseek-harness-<版本>-win-x64-unsigned.exe（NSIS 安装器，无签名，
 #       SmartScreen 拦截时选“更多信息 → 仍要运行”）
@@ -33,10 +31,6 @@ on:
     - cron: "17 2 * * *"
   workflow_dispatch:
     inputs:
-      upstream_ref:
-        description: "上游分支 / tag / commit sha"
-        type: string
-        default: master
       force_build:
         description: "已有同名 release 时也强制重新构建"
         type: boolean
@@ -50,65 +44,141 @@ concurrency:
 
 env:
   UPSTREAM_REPO: deepseek-ai/deepseek-harness
+  BRANCH: master
+  SELF_WORKFLOW: .github/workflows/windows-desktop.yml
 
 jobs:
-  resolve:
+  sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: write # 仅用于下面的 keepalive（重新 enable 本工作流）
+    timeout-minutes: 20
+    # 所有写操作都用 SYNC_TOKEN，GITHUB_TOKEN 不需要任何权限
+    permissions: {}
     outputs:
-      sha: ${{ steps.r.outputs.sha }}
+      fork_sha: ${{ steps.r.outputs.fork_sha }}
+      upstream_sha: ${{ steps.merge.outputs.upstream_sha }}
       version: ${{ steps.r.outputs.version }}
       tag: ${{ steps.r.outputs.tag }}
       build: ${{ steps.r.outputs.build }}
     steps:
-      - id: r
+      - name: Require SYNC_TOKEN
         env:
-          GH_TOKEN: ${{ github.token }}
-          REF: ${{ inputs.upstream_ref || 'master' }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            msg="缺少仓库 secret SYNC_TOKEN。请到 Settings → Secrets and variables → Actions 添加 SYNC_TOKEN（classic PAT，勾选 repo + workflow 权限）后重新运行。"
+            echo "::error title=SYNC_TOKEN missing::$msg"
+            echo "### ❌ $msg" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Merge upstream master into fork master
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "nagatoquin33"
+          git config user.email "nagatoquin33@users.noreply.github.com"
+          git fetch --no-tags "https://github.com/$UPSTREAM_REPO.git" "$BRANCH"
+          UP=$(git rev-parse FETCH_HEAD)
+          echo "upstream_sha=$UP" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$UP" HEAD; then
+            echo "fork 已包含上游 ${UP:0:7}，无需同步"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "### 同步：已是最新（上游 \`${UP:0:7}\`）" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! git merge --no-ff --no-edit -m "Merge $UPSTREAM_REPO@${UP:0:7} into $BRANCH" "$UP"; then
+            echo "::error title=Merge conflict::合并上游 ${UP:0:7} 到 fork $BRANCH 时冲突，未推送任何改动，请手动解决。冲突文件："
+            git diff --name-only --diff-filter=U | sed 's/^/  /'
+            git merge --abort || true
+            exit 1
+          fi
+          # 普通 push（非 force）；如果远端在此期间变化会被拒绝并失败
+          git push origin "HEAD:refs/heads/$BRANCH"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "### 同步：合并上游 \`${UP:0:7}\` → fork \`$(git rev-parse --short HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # 上游的工作流同步进来后默认是启用的；除本工作流外全部禁用，
+      # 并取消这次 push 触发的其它工作流运行。
+      - name: Disable all other workflows in the fork
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          PUSHED: ${{ steps.merge.outputs.pushed }}
+        run: |
+          set -euo pipefail
+          R="$GITHUB_REPOSITORY"
+          HEAD_SHA=$(git rev-parse HEAD)
+          rounds=1
+          [ "$PUSHED" = "true" ] && rounds=3   # 新推送的工作流注册可能有延迟，多扫几轮
+          for i in $(seq 1 "$rounds"); do
+            [ "$i" -gt 1 ] && sleep 15
+            gh api --paginate "repos/$R/actions/workflows?per_page=100" \
+              -q '.workflows[] | select(.path != env.SELF_WORKFLOW) | select(.state == "active") | "\(.id) \(.path)"' \
+            | while read -r id path; do
+                echo "禁用 $path"
+                gh api -X PUT "repos/$R/actions/workflows/$id/disable"
+              done
+            if [ "$PUSHED" = "true" ]; then
+              gh api "repos/$R/actions/runs?head_sha=$HEAD_SHA&per_page=100" \
+                -q '.workflow_runs[] | select(.path != env.SELF_WORKFLOW) | select(.status != "completed") | "\(.id) \(.path)"' \
+              | while read -r id path; do
+                  echo "取消运行 $id ($path)"
+                  gh api -X POST "repos/$R/actions/runs/$id/cancel" || true
+                done
+            fi
+          done
+          echo "当前处于启用状态的工作流："
+          gh api --paginate "repos/$R/actions/workflows?per_page=100" -q '.workflows[] | select(.state == "active") | "  \(.path)"'
+
+      # 公共仓库 60 天无活动会停用定时任务；上游没更新时不会有推送，所以每次都重新 enable 一下保活。
+      - name: Keepalive scheduled workflow
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/windows-desktop.yml/enable"
+
+      - name: Resolve version / tag
+        id: r
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          UP: ${{ steps.merge.outputs.upstream_sha }}
           FORCE: ${{ inputs.force_build || false }}
         run: |
           set -euo pipefail
-          SHA=$(gh api "repos/$UPSTREAM_REPO/commits/$REF" -q .sha)
-          VERSION=$(gh api "repos/$UPSTREAM_REPO/contents/package.json?ref=$SHA" \
-            -H "Accept: application/vnd.github.raw" | jq -r .version)
-          TAG="win-v${VERSION}-${SHA:0:7}"
+          FORK_SHA=$(git rev-parse HEAD)
+          VERSION=$(jq -r .version package.json)
+          TAG="win-v${VERSION}-${UP:0:7}"
           BUILD=true
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             if [ "$FORCE" = "true" ]; then
               echo "release $TAG 已存在，force_build=true，重新构建"
             else
-              echo "release $TAG 已存在（上游 $SHA 已构建过），跳过"
+              echo "release $TAG 已存在（上游 $UP 已构建过），跳过"
               BUILD=false
             fi
           else
-            echo "上游 $SHA (v$VERSION) 尚未构建，开始构建 $TAG"
+            echo "上游 $UP (v$VERSION) 尚未构建，开始构建 $TAG（fork $FORK_SHA）"
           fi
           {
-            echo "sha=$SHA"
+            echo "fork_sha=$FORK_SHA"
             echo "version=$VERSION"
             echo "tag=$TAG"
             echo "build=$BUILD"
           } >> "$GITHUB_OUTPUT"
           {
-            echo "### 上游 \`$UPSTREAM_REPO@${SHA:0:7}\` v$VERSION"
+            echo "fork \`${FORK_SHA:0:7}\` / 上游 \`${UP:0:7}\` v$VERSION"
             echo "tag: \`$TAG\` — build: **$BUILD**"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 公共仓库 60 天无活动会自动停用定时任务；因为我们不往 master 推提交，
-      # 每次运行时重新 enable 一下本工作流来保活。失败不影响主流程。
-      - name: Keepalive scheduled workflow
-        if: github.event_name == 'schedule'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/windows-desktop.yml/enable"
-
   build:
-    needs: resolve
-    if: needs.resolve.outputs.build == 'true'
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
@@ -118,8 +188,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ needs.resolve.outputs.sha }}
+          ref: ${{ needs.sync.outputs.fork_sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@v4
@@ -176,7 +245,7 @@ jobs:
           retention-days: 3
 
   publish:
-    needs: [resolve, build]
+    needs: [sync, build]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -190,9 +259,10 @@ jobs:
       - name: Create / update release
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ needs.resolve.outputs.sha }}
-          VERSION: ${{ needs.resolve.outputs.version }}
-          TAG: ${{ needs.resolve.outputs.tag }}
+          SHA: ${{ needs.sync.outputs.upstream_sha }}
+          FORK_SHA: ${{ needs.sync.outputs.fork_sha }}
+          VERSION: ${{ needs.sync.outputs.version }}
+          TAG: ${{ needs.sync.outputs.tag }}
         run: |
           set -euo pipefail
           R="$GITHUB_REPOSITORY"
@@ -206,7 +276,8 @@ jobs:
           {
             echo "DeepSeek Harness Desktop **v$VERSION** win-x64，无签名安装包。"
             echo
-            echo "自动构建自上游 [\`$UPSTREAM_REPO@${SHA:0:7}\`](https://github.com/$UPSTREAM_REPO/commit/$SHA)。"
+            echo "构建自本 fork [\`${FORK_SHA:0:7}\`]($GITHUB_SERVER_URL/$R/commit/$FORK_SHA)，"
+            echo "已同步上游 [\`$UPSTREAM_REPO@${SHA:0:7}\`](https://github.com/$UPSTREAM_REPO/commit/$SHA)。"
             echo "安装时 SmartScreen 拦截请选“更多信息 → 仍要运行”。"
             echo
             if [ -n "$PREV" ] && [ "$PREV" != "$SHA" ]; then
@@ -218,6 +289,7 @@ jobs:
             fi
             echo "构建日志：$GITHUB_SERVER_URL/$R/actions/runs/$GITHUB_RUN_ID"
             echo
+            echo "fork-sha: $FORK_SHA"
             echo "upstream-sha: $SHA"
           } > notes.md
 
@@ -225,30 +297,8 @@ jobs:
             gh release upload "$TAG" dist/*.exe --clobber -R "$R"
             gh release edit "$TAG" --notes-file notes.md -R "$R"
           else
-            TITLE="DeepSeek Harness Desktop win-x64 (unsigned) v$VERSION @ ${SHA:0:7}"
-            # tag 尽量直接指向上游提交（同一 fork 网络内可见）；不行就退回 fork 默认分支
-            gh release create "$TAG" dist/*.exe -R "$R" --target "$SHA" \
-                --title "$TITLE" --notes-file notes.md --latest \
-              || gh release create "$TAG" dist/*.exe -R "$R" \
-                --title "$TITLE" --notes-file notes.md --latest
+            gh release create "$TAG" dist/*.exe -R "$R" --target "$FORK_SHA" \
+              --title "DeepSeek Harness Desktop win-x64 (unsigned) v$VERSION @ ${SHA:0:7}" \
+              --notes-file notes.md --latest
           fi
           echo "发布: $GITHUB_SERVER_URL/$R/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
-
-  # 可选：让 fork 的 master 也跟上游同步（等同网页上的 “Sync fork”）。
-  # 需要 secret SYNC_TOKEN（PAT，repo + workflow 权限，因为上游会改 .github/workflows）。
-  # 没配置就跳过；失败也不影响构建和发布。
-  sync-fork:
-    needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    continue-on-error: true
-    permissions: {}
-    steps:
-      - env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "未配置 SYNC_TOKEN，跳过同步 fork master（不影响 Windows 构建）"
-            exit 0
-          fi
-          gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=master
