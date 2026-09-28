@@ -1,82 +1,126 @@
-# DeepSeek Harness Desktop (Windows) — fork 自动化
+# DeepSeek Harness Desktop (Windows) — fork 自动化：直接构建上游，不改 fork 的 master
 #
-# 每天 02:00 UTC（北京时间 10:00）同步上游 master，有新提交时在 windows runner
-# 上构建无签名 Windows 安装包，并替换 windows-rolling release（固定下载地址）。
+# 设计：
+#   每 6 小时（UTC 00:17/06:17/12:17/18:17 = 北京时间 08:17/14:17/20:17/02:17）
+#   查询上游 deepseek-ai/deepseek-harness 的 master 最新提交。
+#   如果 fork 里还没有对应的 release（tag = win-v<上游版本>-<上游短 sha>），就：
+#     1. resolve (ubuntu)  : 解析上游 sha / 版本，判断是否需要构建
+#     2. build   (windows) : 直接 checkout 上游该 sha，写入本 fork 的打包配置，打无签名安装包
+#     3. publish (ubuntu)  : 在本 fork 创建 GitHub Release 并上传 .exe（release 不会过期）
 #
-# - 手动触发: Actions 页面 Run workflow（可勾选 force_build 强制构建）
-# - push 到 master 也会直接构建（同步 job 用的 GITHUB_TOKEN 推送不会递归触发）
-# - 产物: deepseek-harness-<版本>-win-x64-unsigned.exe（NSIS 安装器，无签名，
-#   SmartScreen 拦截时选“更多信息 → 仍要运行”）
+#   为什么不同步 master 再构建：GITHUB_TOKEN 不能推送修改 .github/workflows/* 的提交，
+#   而上游经常改工作流；另外同步进来的上游工作流会在 fork 里被启用、白白跑失败。
+#   直接构建上游 sha 完全绕开这两个问题。fork 的定制只剩这一个文件（上游不会碰它）。
+#
+#   “上次构建到哪个上游 sha” 就记录在 release 的 tag 和正文 (upstream-sha: ...) 里，
+#   构建失败不会产生 release，下一次定时任务会自动重试。
+#
+# 手动运行：Actions → windows-desktop → Run workflow
+#   - upstream_ref: 上游分支 / tag / sha（默认 master）
+#   - force_build : 已有同名 release 时也重新构建并覆盖安装包
+#
+# 可选：想让 fork 的 master 也跟着上游走，添加仓库 secret SYNC_TOKEN
+# （具有 repo + workflow 权限的 PAT）。没有该 secret 时 sync-fork 任务直接跳过，不影响构建。
+#
+# 产物：deepseek-harness-<版本>-win-x64-unsigned.exe（NSIS 安装器，无签名，
+#       SmartScreen 拦截时选“更多信息 → 仍要运行”）
+# 固定下载页：https://github.com/<owner>/deepseek-harness/releases/latest
 
 name: windows-desktop
 
 on:
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
+      upstream_ref:
+        description: "上游分支 / tag / commit sha"
+        type: string
+        default: master
       force_build:
-        description: "上游无新提交时也强制构建"
+        description: "已有同名 release 时也强制重新构建"
         type: boolean
         default: false
-  push:
-    branches: [master]
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: windows-desktop
   cancel-in-progress: false
 
+env:
+  UPSTREAM_REPO: deepseek-ai/deepseek-harness
+
 jobs:
-  sync:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+  resolve:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write # 仅用于下面的 keepalive（重新 enable 本工作流）
     outputs:
-      changed: ${{ steps.sync.outputs.changed }}
+      sha: ${{ steps.r.outputs.sha }}
+      version: ${{ steps.r.outputs.version }}
+      tag: ${{ steps.r.outputs.tag }}
+      build: ${{ steps.r.outputs.build }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - id: sync
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.upstream_ref || 'master' }}
+          FORCE: ${{ inputs.force_build || false }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          BEFORE=$(git rev-parse HEAD)
-          git remote add upstream https://github.com/deepseek-ai/deepseek-harness.git
-          git fetch upstream master
-          git rebase upstream/master
-          AFTER=$(git rev-parse HEAD)
-          if [ "$BEFORE" != "$AFTER" ]; then
-            git push --force-with-lease origin master
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "synced $BEFORE -> $AFTER"
+          set -euo pipefail
+          SHA=$(gh api "repos/$UPSTREAM_REPO/commits/$REF" -q .sha)
+          VERSION=$(gh api "repos/$UPSTREAM_REPO/contents/package.json?ref=$SHA" \
+            -H "Accept: application/vnd.github.raw" | jq -r .version)
+          TAG="win-v${VERSION}-${SHA:0:7}"
+          BUILD=true
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$FORCE" = "true" ]; then
+              echo "release $TAG 已存在，force_build=true，重新构建"
+            else
+              echo "release $TAG 已存在（上游 $SHA 已构建过），跳过"
+              BUILD=false
+            fi
           else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "already up to date at $BEFORE"
+            echo "上游 $SHA (v$VERSION) 尚未构建，开始构建 $TAG"
           fi
+          {
+            echo "sha=$SHA"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "build=$BUILD"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### 上游 \`$UPSTREAM_REPO@${SHA:0:7}\` v$VERSION"
+            echo "tag: \`$TAG\` — build: **$BUILD**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 公共仓库 60 天无活动会自动停用定时任务；因为我们不往 master 推提交，
+      # 每次运行时重新 enable 一下本工作流来保活。失败不影响主流程。
+      - name: Keepalive scheduled workflow
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/windows-desktop.yml/enable"
 
   build:
-    needs: sync
-    if: >-
-      always() &&
-      (
-        github.event_name == 'push' ||
-        (needs.sync.result == 'success' && needs.sync.outputs.changed == 'true') ||
-        (github.event_name == 'workflow_dispatch' && inputs.force_build == true)
-      )
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
     runs-on: windows-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
     env:
       DSH_DESKTOP_APP_ID: com.deepseek.desktop
     steps:
-      # 同步后 master 前进了，这里必须显式取 master 而不是触发时的 sha
       - uses: actions/checkout@v4
         with:
-          ref: master
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -92,7 +136,7 @@ jobs:
       - name: Build (native addon + libs + web frontend)
         run: pnpm run build
 
-      # 打包必读配置：无签名构建指向官方生产更新源（真实可达，避免假域名的不确定行为）
+      # 本 fork 的打包配置：无签名构建指向官方生产更新源
       - name: Write .env.windows
         shell: bash
         run: |
@@ -106,26 +150,105 @@ jobs:
       - name: Package Windows x64 (unsigned)
         run: pnpm --filter @deepseek-ai/dsh-desktop run package:win:x64 -- --unsigned
 
-      - name: List artifacts
+      - name: Check installer
         shell: bash
-        run: ls -la apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts
+        run: |
+          set -euo pipefail
+          DIR=apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts
+          ls -la "$DIR"
+          shopt -s nullglob
+          files=("$DIR"/*.exe)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::no .exe produced"; exit 1; }
+          for f in "${files[@]}"; do
+            size=$(stat -c %s "$f")
+            echo "$f: $size bytes"
+            # GitHub release 单个附件上限 2 GiB
+            [ "$size" -lt 2000000000 ] || { echo "::error::$f exceeds release asset limit"; exit 1; }
+          done
 
+      # 只传 .exe，短期保留，仅用于把安装包交给 publish 任务
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-win-x64-unsigned
-          path: apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*
+          path: apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
           if-no-files-found: error
-          retention-days: 14
+          compression-level: 0
+          retention-days: 3
 
-      - name: Publish rolling release
-        shell: bash
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-win-x64-unsigned
+          path: dist
+
+      - name: Create / update release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          SHA=$(git rev-parse --short HEAD)
-          gh release delete windows-rolling --yes --cleanup-tag || true
-          gh release create windows-rolling \
-            apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe \
-            --title "DeepSeek Harness Desktop win-x64 (unsigned) v$VERSION @ $SHA" \
-            --notes "自动构建自上游 master @ $SHA。未签名：安装时 SmartScreen 拦截请选“更多信息 → 仍要运行”。"
+          set -euo pipefail
+          R="$GITHUB_REPOSITORY"
+          ls -la dist
+
+          # 上一次构建的上游 sha（取最新的 win-* release 正文中的标记）
+          PREV=$(gh api "repos/$R/releases?per_page=50" \
+            -q '[.[] | select(.tag_name | startswith("win-")) | select(.tag_name != env.TAG)][0].body // ""' \
+            | sed -n 's/^upstream-sha: *\([0-9a-f]\{40\}\).*/\1/p' | head -n1 || true)
+
+          {
+            echo "DeepSeek Harness Desktop **v$VERSION** win-x64，无签名安装包。"
+            echo
+            echo "自动构建自上游 [\`$UPSTREAM_REPO@${SHA:0:7}\`](https://github.com/$UPSTREAM_REPO/commit/$SHA)。"
+            echo "安装时 SmartScreen 拦截请选“更多信息 → 仍要运行”。"
+            echo
+            if [ -n "$PREV" ] && [ "$PREV" != "$SHA" ]; then
+              echo "#### 自上次构建以来的上游提交（[${PREV:0:7}...${SHA:0:7}](https://github.com/$UPSTREAM_REPO/compare/$PREV...$SHA)）"
+              echo
+              gh api "repos/$UPSTREAM_REPO/compare/$PREV...$SHA" \
+                -q '.commits | reverse | .[:60][] | "- \(.sha[0:7]) \(.commit.message | split("\n")[0])"' || true
+              echo
+            fi
+            echo "构建日志：$GITHUB_SERVER_URL/$R/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "upstream-sha: $SHA"
+          } > notes.md
+
+          if gh release view "$TAG" -R "$R" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.exe --clobber -R "$R"
+            gh release edit "$TAG" --notes-file notes.md -R "$R"
+          else
+            TITLE="DeepSeek Harness Desktop win-x64 (unsigned) v$VERSION @ ${SHA:0:7}"
+            # tag 尽量直接指向上游提交（同一 fork 网络内可见）；不行就退回 fork 默认分支
+            gh release create "$TAG" dist/*.exe -R "$R" --target "$SHA" \
+                --title "$TITLE" --notes-file notes.md --latest \
+              || gh release create "$TAG" dist/*.exe -R "$R" \
+                --title "$TITLE" --notes-file notes.md --latest
+          fi
+          echo "发布: $GITHUB_SERVER_URL/$R/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+
+  # 可选：让 fork 的 master 也跟上游同步（等同网页上的 “Sync fork”）。
+  # 需要 secret SYNC_TOKEN（PAT，repo + workflow 权限，因为上游会改 .github/workflows）。
+  # 没配置就跳过；失败也不影响构建和发布。
+  sync-fork:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions: {}
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "未配置 SYNC_TOKEN，跳过同步 fork master（不影响 Windows 构建）"
+            exit 0
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=master
