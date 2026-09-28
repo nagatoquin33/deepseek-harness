@@ -1,0 +1,120 @@
+# DeepSeek Harness Desktop (Windows) — fork 自动化
+#
+# 每天 02:00 UTC（北京时间 10:00）同步上游 master，有新提交时在 windows runner
+# 上构建无签名 Windows 安装包，并替换 windows-rolling release（固定下载地址）。
+#
+# - 手动触发: Actions 页面 Run workflow（可勾选 force_build 强制构建）
+# - push 到 master 也会直接构建（同步 job 用的 GITHUB_TOKEN 推送不会递归触发）
+# - 产物: deepseek-harness-<版本>-win-x64-unsigned.exe（NSIS 安装器，无签名，
+#   SmartScreen 拦截时选“更多信息 → 仍要运行”）
+
+name: windows-desktop
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "上游无新提交时也强制构建"
+        type: boolean
+        default: false
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-desktop
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BEFORE=$(git rev-parse HEAD)
+          git remote add upstream https://github.com/deepseek-ai/deepseek-harness.git
+          git fetch upstream master
+          git rebase upstream/master
+          AFTER=$(git rev-parse HEAD)
+          if [ "$BEFORE" != "$AFTER" ]; then
+            git push --force-with-lease origin master
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "synced $BEFORE -> $AFTER"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "already up to date at $BEFORE"
+          fi
+
+  build:
+    needs: sync
+    if: >-
+      always() &&
+      (
+        github.event_name == 'push' ||
+        (needs.sync.result == 'success' && needs.sync.outputs.changed == 'true') ||
+        (github.event_name == 'workflow_dispatch' && inputs.force_build == true)
+      )
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      DSH_DESKTOP_APP_ID: com.deepseek.desktop
+    steps:
+      # 同步后 master 前进了，这里必须显式取 master 而不是触发时的 sha
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm (version pinned by packageManager field)
+        shell: bash
+        run: npm install -g "pnpm@$(node -p "require('./package.json').packageManager.split('pnpm@')[1]")"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (native addon + libs + web frontend)
+        run: pnpm run build
+
+      - name: Package Windows x64 (unsigned)
+        run: pnpm --filter @deepseek-ai/dsh-desktop run package:win:x64 -- --unsigned
+
+      - name: List artifacts
+        shell: bash
+        run: ls -la apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-win-x64-unsigned
+          path: apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish rolling release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          SHA=$(git rev-parse --short HEAD)
+          gh release delete windows-rolling --yes --cleanup-tag || true
+          gh release create windows-rolling \
+            apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe \
+            --title "DeepSeek Harness Desktop win-x64 (unsigned) v$VERSION @ $SHA" \
+            --notes "自动构建自上游 master @ $SHA。未签名：安装时 SmartScreen 拦截请选“更多信息 → 仍要运行”。"
