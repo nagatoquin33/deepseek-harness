@@ -92,6 +92,17 @@ jobs:
       - name: Build (native addon + libs + web frontend)
         run: pnpm run build
 
+      # 打包必读配置：无签名构建指向官方生产更新源（真实可达，避免假域名的不确定行为）
+      - name: Write .env.windows
+        shell: bash
+        run: |
+          cat > apps/desktop/.env.windows <<'EOF'
+          DSH_DESKTOP_APP_ID=com.deepseek.desktop
+          DSH_DESKTOP_AUTO_UPDATE_ENV=production
+          DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://download.deepseek.com
+          DSH_DESKTOP_MANDATORY_UPDATE_CONFIG={"allowedPageOrigins":["https://download.deepseek.com"]}
+          EOF
+
       - name: Package Windows x64 (unsigned)
         run: pnpm --filter @deepseek-ai/dsh-desktop run package:win:x64 -- --unsigned
 
